@@ -45,7 +45,6 @@ SCRIPTS/
 ├── CONFIGURATION_FILE/
 │   ├── set_environment.bash          ← Activates the BPS conda environment and sets library paths
 │   ├── AUX_442/                      ← Example of default AUX files for BPS v4.4.2 (INS, PP1, PP2, PPS, …)
-│   ├── internal_resources/           ← Static AUX files: for exemple GMF
 │   └── JO_TEMPLATE/                  ← Templates for generating the JobOrder XML files
 │       ├── BIO_L1F_P_TEMPLATE_JobOrder.xml
 │       ├── BIO_L1_P_TEMPLATE_JobOrder.xml
