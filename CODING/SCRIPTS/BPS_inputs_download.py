@@ -1,20 +1,35 @@
 # BPS_inputs_download is a set of functions that allows users to download automatically all the necessary input files to be used within the ESA BPS, given one single Biomass L0S (RAW_0S) product id.
 # DISCLAIMER: this is a first version with limited functionalities. Further improvements and other features will be implemented.
 
-# For any information_______Joseph Melizza (joseph.melizza@serco.com)
+#########################################################################################################################
+########################## For any information_______Joseph Melizza (joseph.melizza@serco.com) ##########################
+#########################################################################################################################
 
-# Version 0.1.1
+# Version 0.1.3
 
-# Fixes: 
+# Fixes in v.0.1.1: 
 # 1. output products to be searched also considering the RAW_0S input baseline (productVersion)
 # 2. metadata values are now extracted from the ogc_17 file (metadata_ogc_17_003r2) instead of the ogc_10 file (metadata_ogc_10_157r4)
 # 3. output searching criteria to be displayed after the script is launched (track number, frame number, global coverage, repeat cycle, major cycle and baseline)
+
+# Fixes in v.0.1.2: 
+# 1. added bps_l0_extraction_tool in function get_NetCDF
+
+# Fixes in v.0.1.3: 
+# 1. added functions to check duplicate products within the catalogue and to check RAW_0M products with same repeat cycle (C) with matching time interval:
+#    - _decode_timestamp
+#    - _group_key
+#    - dedupe_most_recent
+#    - filter_matching_products
+#    - _parse_item
+#    - check_major_cycle_0M
 
 
 
 from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 from pystac_client import Client
+from pathlib import Path
 from tqdm import tqdm
 import urllib.request
 import numpy as np
@@ -24,6 +39,80 @@ import fsspec
 import json
 import os
 import io
+import re
+
+
+
+BASE_DATE = datetime(2000, 1, 1)
+
+
+def _decode_timestamp(item_id: str) -> datetime:
+    """Decode the trailing base-36 suffix of an item id into a datetime."""
+    suffix = item_id.split('_')[-1]
+    seconds = int(suffix, 36)
+    return BASE_DATE + timedelta(seconds=seconds)
+
+
+def _group_key(item_id: str) -> str:
+    """Everything except the trailing timestamp suffix (used to identify duplicates)."""
+    return item_id.rsplit('_', 1)[0]
+
+
+def dedupe_most_recent(items):
+    """
+    Given a list of Item objects (each with an `.id` attribute),
+    return a list containing only the most recent item per unique product
+    (i.e. duplicates that differ only in the trailing timestamp suffix
+    are collapsed to the latest one).
+    """
+    latest_by_group = {}
+
+    for item in items:
+        key = _group_key(item.id)
+        ts = _decode_timestamp(item.id)
+
+        if key not in latest_by_group or ts > latest_by_group[key][1]:
+            latest_by_group[key] = (item, ts)
+
+    return [item for item, _ in latest_by_group.values()]
+
+
+
+def filter_matching_products(items, reference_datetime):
+    """
+    Given a list of Item objects (each with an `.id` attribute) and a
+    reference datetime interval (e.g. ['2026-04-23T09:57:31.000Z',
+    '2026-04-23T09:59:28.000Z']), return one item per cycle (C01, C02, ...)
+    such that:
+
+      1. the item's time-of-day interval contains the reference product's
+         time-of-day interval (the date itself is ignored, since each
+         cycle repeats the same ground track at a similar local time but
+         on a different date), and
+      2. if multiple items in the same cycle satisfy (1), only the one
+         with the largest datetime interval (longest duration) is kept.
+    """
+    ref_start, ref_stop = _parse_reference_datetime(reference_datetime)
+    ref_start_t, ref_stop_t = ref_start.time(), ref_stop.time()
+
+    best_by_cycle = {}
+
+    for item in items:
+        start, stop, cycle = _parse_item(item.id)
+        start_t, stop_t = start.time(), stop.time()
+
+        # Condition 1: time-of-day containment
+        if not (start_t <= ref_start_t and stop_t >= ref_stop_t):
+            continue
+
+        # Condition 2: keep the longest-duration item per cycle
+        duration = stop - start
+        if cycle not in best_by_cycle or duration > best_by_cycle[cycle][1]:
+            best_by_cycle[cycle] = (item, duration)
+
+    # Sort output by cycle number for readability (C01, C02, ...)
+    return [item for _, (item, _) in sorted(best_by_cycle.items())]
+
 
 
 
@@ -47,10 +136,16 @@ def product_search(catalog, collections, prod_type, datetime, baseline):
                 version='{baseline}'",
     datetime = datetime,
     method = "GET",
-    max_items = 1,  
+    #max_items = 1,  
     )
 
-    items = list(search.items())
+    # Gives a list of items considering the most recent product in case there are two identical ids, based on the last 6 digits. For example:
+    # BIO_S1_RAW__0M_20251121T094510_20251121T095758_T_G01_M01_C01_T006_F____01_DNGC54
+    # BIO_S1_RAW__0M_20251121T094510_20251121T095758_T_G01_M01_C01_T006_F____01_DNPTVM
+    # It gives only BIO_S1_RAW__0M_20251121T094510_20251121T095758_T_G01_M01_C01_T006_F____01_DNPTVM
+    
+    items = dedupe_most_recent(list(search.items()))
+
     return items
 
 
@@ -82,44 +177,14 @@ def product_search_majorcycle(catalog, collections, prod_type, global_id, major_
             version='{baseline}'",
         
     method = "GET",
-    max_items = 10,  
+    #max_items = 10,  
     )
 
-    items = list(search.items())
+    items = dedupe_most_recent(list(search.items()))
+    
     return items
 
 
-def product_search_majorcycle_0M(catalog, collections, prod_type, global_id, major_cycle, track, baseline):
-    """
-    Searches a STAC catalog for 0M-type product matching a given product type within a specific major cycle and track (0M products do not have frame).
-
-    Args:
-        catalog (Client): a pystac_client Client instance connected to the catalog.
-        collections (list[str]): list of collection names to search in.
-        prod_type (str): product type filter string (e.g. 'AUX_ATT___').
-        global_id (int): global coverage ID to filter by (eofeos:global_coverage_id).
-        major_cycle (int): major cycle ID to filter by (eofeos:major_cycle_id).
-        track (int): track number to filter by.
-        baseline (str): baseline number to filter by
-
-    Returns:
-        list[Item]: a list of matching STAC Items, up to 10.
-    """
-
-    search = catalog.search(
-    collections = collections,
-    filter = f"product:type='{prod_type}' and\
-            eofeos:global_coverage_id={global_id} and\
-            eofeos:major_cycle_id={major_cycle} and\
-            track={track} and\
-            version='{baseline}'",
-        
-    method = "GET",
-    max_items = 10,  
-    )
-
-    items = list(search.items())
-    return items
 
 
 def download_product(urls, output_path, disable_bar=False):
@@ -275,7 +340,7 @@ def get_raw_repeat_cycle(ID, output_path):
     collections = ["BiomassLevel0","BiomassLevel0IOC"],
     ids=ID,
     method = "GET",
-    max_items = 1,  
+    #max_items = 1,  
     )
 
     items = list(search.items())
@@ -362,6 +427,46 @@ def get_raw_repeat_cycle(ID, output_path):
     return L0_S, L0_M, BIO_AUX_ATT, BIO_AUX_ORB, BIO_AUX_TEC
 
 
+
+_PATTERN = re.compile(
+    r'_(?P<start>\d{8}T\d{6})_(?P<stop>\d{8}T\d{6})_T_G\d{2}_M\d{2}_(?P<cycle>C\d{2})_'
+)
+
+_DT_FMT = "%Y%m%dT%H%M%S"
+
+
+def _parse_item(item_id: str):
+    """Extract (start, stop, cycle) from an item id."""
+    match = _PATTERN.search(item_id)
+    if not match:
+        raise ValueError(f"Could not parse item id: {item_id}")
+
+    start = datetime.strptime(match.group("start"), _DT_FMT)
+    stop = datetime.strptime(match.group("stop"), _DT_FMT)
+    cycle = match.group("cycle")
+    return start, stop, cycle
+
+
+def check_major_cycle_0M(items):
+    """
+    Given a list of Item objects, return a
+    reduced list containing only one item per cycle (C01, C02, ...): the
+    one with the largest time interval (start-to-stop duration).
+    """
+    best_by_cycle = {}
+
+    for item in items:
+        start, stop, cycle = _parse_item(item.id)
+        duration = stop - start
+
+        if cycle not in best_by_cycle or duration > best_by_cycle[cycle][1]:
+            best_by_cycle[cycle] = (item, duration)
+
+    # Sort output by cycle number for readability (C01, C02, ...)
+    return [item for _, (item, _) in sorted(best_by_cycle.items())]
+
+
+
 def get_raws_major_cycle(ID, output_path):
     """
     Downloads all raw input products needed for a full major cycle.
@@ -389,7 +494,7 @@ def get_raws_major_cycle(ID, output_path):
     collections = ["BiomassLevel0","BiomassLevel0IOC"],
     ids=ID,
     method = "GET",
-    max_items = 1,  
+    #max_items = 1,  
     )
 
     items = list(search.items())
@@ -422,8 +527,16 @@ def get_raws_major_cycle(ID, output_path):
     
     L0S_items = product_search_majorcycle(catalog, collections, prod_type_0S, global_id, major_cycle, track, frame, baseline)
 
-    # Get the 0M products
-    L0M_items = product_search_majorcycle_0M(catalog, collections, prod_type_0M, global_id, major_cycle, track, baseline)
+    L0M_items = []
+    for item in L0S_items:
+        start_date = item.properties.get("start_datetime")
+        end_date = item.properties.get("end_datetime")
+    
+        datetime = [start_date, end_date]
+        L0M_items.extend(product_search(catalog, collections, prod_type_0M, datetime, baseline))
+
+    # Check if there are multiple products with same repeat cycle and take the one with the largest time interval
+    L0M_items = check_major_cycle_0M(L0M_items)
 
     # Get the AUX products
     collections = ["BiomassAuxIOC","BiomassAux","BiomassAuxRest"]
@@ -440,7 +553,7 @@ def get_raws_major_cycle(ID, output_path):
         ATT_items.extend(product_search(catalog, collections, 'AUX_ATT___', datetime, baseline))
         ORB_items.extend(product_search(catalog, collections, 'AUX_ORB___', datetime, baseline))
         TEC_items.extend(product_search(catalog, collections, 'AUX_TEC___', datetime, baseline))
-    
+
 
     total_prod = L0S_items + L0M_items + ATT_items + ORB_items + TEC_items
     
@@ -492,3 +605,81 @@ def get_raws_major_cycle(ID, output_path):
     download_product(ATT_urls, output_path, disable_bar=False)
     download_product(ORB_urls, output_path, disable_bar=False)
     download_product(TEC_urls, output_path, disable_bar=False)
+
+
+    
+def get_NetCDF(input_path, output_path, start, stop):
+
+    '''
+    Generates a NetCDF file starting from RAW_0S, RAW_0M, AUX_ATT, AUX_orb and AUX_INS files.
+
+    Args:
+        input_path (Path): path to the input products (RAW_0S, RAW_0M, AUX_ATT, AUX_orb, AUX_INS).
+        output_path (Path): path to the output NetCDF file.
+        start (str): start time of interest, e.g. '09-APR-2026 03:59:50.000000'.
+        stop (str): stop time of interest, e.g. '09-APR-2026 03:59:50.000000'.
+
+    Returns:
+        NetCDF file [.nc file]: single NetCDF file with the same name of input L0S product.
+    '''
+
+    from bps.l0_extraction_tool.main import run
+
+    inputs_dir = Path(os.path.join(input_path, 'Inputs'))
+    output_path = Path(output_path)
+    # Map each variable to its identifying pattern
+    patterns = {
+        "l0s":     "RAW__0S",
+        "l0m":     "RAW__0M",
+        "aux_att": "AUX_ATT",
+        "aux_orb": "AUX_ORB",
+        "aux_ins": "AUX_INS",
+    }
+    
+    # Search subfolders and match patterns
+    found = {}
+    for var_name, pattern in patterns.items():
+        matches = [p for p in inputs_dir.iterdir() if p.is_dir() and pattern in p.name]
+        if len(matches) == 1:
+            found[var_name] = matches[0]
+        elif len(matches) == 0:
+            print(f"WARNING: No folder found for '{var_name}' (pattern: '{pattern}')")
+            found[var_name] = None
+        else:
+            print(f"WARNING: Multiple matches for '{var_name}' (pattern: '{pattern}'): {matches}")
+            found[var_name] = None
+    
+    # Unpack into individual variables
+    l0s_product_path     = found["l0s"]
+    l0m_product_path     = found["l0m"]
+    aux_att_product_path = found["aux_att"]
+    aux_orb_product_path = found["aux_orb"]
+    aux_ins_product_path = found["aux_ins"]
+    
+    # Print results
+    for name, path in found.items():
+        print(f"{name}: {path}")
+
+
+    # Run the l0_extraction_tool
+    run(
+    l0s_product_path,
+    l0m_product_path,
+    aux_orb_product_path,
+    aux_att_product_path,
+    aux_ins_product_path,
+    start,
+    stop,
+    output_path,
+    )
+
+
+
+    
+
+
+
+
+
+
+
